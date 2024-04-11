@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -1221,99 +1222,158 @@ func registerBucketRewrite(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 			chunkPool := chunkenc.NewPool()
 			changeLog := compactv2.NewChangeLog(io.Discard)
 			stubCounter := promauto.With(nil).NewCounter(prometheus.CounterOpts{})
+
+			pending := make(chan ulid.ULID, len(ids))
 			for _, id := range ids {
-				// Delete series from block & modify.
-				level.Info(logger).Log("msg", "downloading block", "source", id)
-				if err := block.Download(ctx, logger, insBkt, id, filepath.Join(tbc.tmpDir, id.String())); err != nil {
-					return errors.Wrapf(err, "download %v", id)
-				}
-
-				meta, err := metadata.ReadFromDir(filepath.Join(tbc.tmpDir, id.String()))
-				if err != nil {
-					return errors.Wrapf(err, "read meta of %v", id)
-				}
-				b, err := tsdb.OpenBlock(logger, filepath.Join(tbc.tmpDir, id.String()), chunkPool)
-				if err != nil {
-					return errors.Wrapf(err, "open block %v", id)
-				}
-
-				p := compactv2.NewProgressLogger(logger, int(b.Meta().Stats.NumSeries))
-				newID := ulid.MustNew(ulid.Now(), rand.Reader)
-				meta.ULID = newID
-				meta.Thanos.Rewrites = append(meta.Thanos.Rewrites, metadata.Rewrite{
-					Sources:          meta.Compaction.Sources,
-					DeletionsApplied: deletions,
-					RelabelsApplied:  relabels,
-				})
-				meta.Compaction.Sources = []ulid.ULID{newID}
-				meta.Thanos.Source = metadata.BucketRewriteSource
-
-				if err := os.MkdirAll(filepath.Join(tbc.tmpDir, newID.String()), os.ModePerm); err != nil {
-					return err
-				}
-
-				if *provideChangeLog {
-					f, err := os.OpenFile(filepath.Join(tbc.tmpDir, newID.String(), "change.log"), os.O_CREATE|os.O_WRONLY, os.ModePerm)
-					if err != nil {
-						return err
-					}
-					defer runutil.CloseWithLogOnErr(logger, f, "close changelog")
-
-					changeLog = compactv2.NewChangeLog(f)
-					level.Info(logger).Log("msg", "changelog will be available", "file", filepath.Join(tbc.tmpDir, newID.String(), "change.log"))
-				}
-
-				d, err := block.NewDiskWriter(ctx, logger, filepath.Join(tbc.tmpDir, newID.String()))
-				if err != nil {
-					return err
-				}
-
-				var comp *compactv2.Compactor
-				if tbc.dryRun {
-					comp = compactv2.NewDryRun(tbc.tmpDir, logger, changeLog, chunkPool)
-				} else {
-					comp = compactv2.New(tbc.tmpDir, logger, changeLog, chunkPool)
-				}
-
-				level.Info(logger).Log("msg", "starting rewrite for block", "source", id, "new", newID, "toDelete", string(deletionsYaml), "toRelabel", string(relabelYaml))
-				if err := comp.WriteSeries(ctx, []block.Reader{b}, d, p, modifiers...); err != nil {
-					return errors.Wrapf(err, "writing series from %v to %v", id, newID)
-				}
-
-				if tbc.dryRun {
-					level.Info(logger).Log("msg", "dry run finished. Changes should be printed to stderr", "Block ID", id)
-					continue
-				}
-
-				level.Info(logger).Log("msg", "wrote new block after modifications; flushing", "source", id, "new", newID)
-				meta.Stats, err = d.Flush()
-				if err != nil {
-					return errors.Wrap(err, "flush")
-				}
-				if err := meta.WriteToDir(logger, filepath.Join(tbc.tmpDir, newID.String())); err != nil {
-					return err
-				}
-
-				level.Info(logger).Log("msg", "uploading new block", "source", id, "new", newID)
-				if tbc.promBlocks {
-					if err := block.UploadPromBlock(ctx, logger, insBkt, filepath.Join(tbc.tmpDir, newID.String()), metadata.HashFunc(*hashFunc)); err != nil {
-						return errors.Wrap(err, "upload")
-					}
-				} else {
-					if err := block.Upload(ctx, logger, insBkt, filepath.Join(tbc.tmpDir, newID.String()), metadata.HashFunc(*hashFunc)); err != nil {
-						return errors.Wrap(err, "upload")
-					}
-				}
-				level.Info(logger).Log("msg", "uploaded", "source", id, "new", newID)
-
-				if !tbc.dryRun && tbc.deleteBlocks {
-					if err := block.MarkForDeletion(ctx, logger, insBkt, id, "block rewritten", stubCounter); err != nil {
-						level.Error(logger).Log("msg", "failed to mark block for deletion", "id", id.String(), "err", err)
-					}
-				}
+				pending <- id
 			}
-			level.Info(logger).Log("msg", "rewrite done", "IDs", strings.Join(tbc.blockIDs, ","))
-			return nil
+			close(pending)
+			downloaded := make(chan ulid.ULID)
+			type blockIDs struct{ old, new ulid.ULID }
+			rewritten := make(chan blockIDs)
+
+			errs := make(chan error, len(ids))
+			wg := sync.WaitGroup{}
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer close(downloaded)
+				for id := range pending {
+					// Delete series from block & modify.
+					level.Info(logger).Log("msg", "downloading block", "source", id, "pending", len(pending))
+					if err := block.Download(ctx, logger, insBkt, id, filepath.Join(tbc.tmpDir, id.String())); err != nil {
+						errs <- errors.Wrapf(err, "download %v", id)
+						return
+					}
+					downloaded <- id
+				}
+			}()
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer close(rewritten)
+
+				for id := range downloaded {
+					meta, err := metadata.ReadFromDir(filepath.Join(tbc.tmpDir, id.String()))
+					if err != nil {
+						errs <- errors.Wrapf(err, "read meta of %v", id)
+						return
+					}
+					b, err := tsdb.OpenBlock(logger, filepath.Join(tbc.tmpDir, id.String()), chunkPool)
+					if err != nil {
+						errs <- errors.Wrapf(err, "open block %v", id)
+						return
+					}
+
+					p := compactv2.NewProgressLogger(logger, int(b.Meta().Stats.NumSeries))
+					newID := ulid.MustNew(ulid.Now(), rand.Reader)
+					meta.ULID = newID
+					meta.Thanos.Rewrites = append(meta.Thanos.Rewrites, metadata.Rewrite{
+						Sources:          meta.Compaction.Sources,
+						DeletionsApplied: deletions,
+						RelabelsApplied:  relabels,
+					})
+					meta.Compaction.Sources = []ulid.ULID{newID}
+					meta.Thanos.Source = metadata.BucketRewriteSource
+
+					if err := os.MkdirAll(filepath.Join(tbc.tmpDir, newID.String()), os.ModePerm); err != nil {
+						errs <- err
+						return
+					}
+
+					if *provideChangeLog {
+						f, err := os.OpenFile(filepath.Join(tbc.tmpDir, newID.String(), "change.log"), os.O_CREATE|os.O_WRONLY, os.ModePerm)
+						if err != nil {
+							errs <- err
+							return
+						}
+						defer runutil.CloseWithLogOnErr(logger, f, "close changelog")
+
+						changeLog = compactv2.NewChangeLog(f)
+						level.Info(logger).Log("msg", "changelog will be available", "file", filepath.Join(tbc.tmpDir, newID.String(), "change.log"))
+					}
+
+					d, err := block.NewDiskWriter(ctx, logger, filepath.Join(tbc.tmpDir, newID.String()))
+					if err != nil {
+						errs <- err
+						return
+					}
+
+					var comp *compactv2.Compactor
+					if tbc.dryRun {
+						comp = compactv2.NewDryRun(tbc.tmpDir, logger, changeLog, chunkPool)
+					} else {
+						comp = compactv2.New(tbc.tmpDir, logger, changeLog, chunkPool)
+					}
+
+					level.Info(logger).Log("msg", "starting rewrite for block", "source", id, "new", newID, "toDelete", string(deletionsYaml), "toRelabel", string(relabelYaml))
+					if err := comp.WriteSeries(ctx, []block.Reader{b}, d, p, modifiers...); err != nil {
+						errs <- errors.Wrapf(err, "writing series from %v to %v", id, newID)
+						return
+					}
+
+					if tbc.dryRun {
+						level.Info(logger).Log("msg", "dry run finished. Changes should be printed to stderr", "Block ID", id)
+						continue
+					}
+
+					level.Info(logger).Log("msg", "wrote new block after modifications; flushing", "source", id, "new", newID)
+					meta.Stats, err = d.Flush()
+					if err != nil {
+						errs <- errors.Wrap(err, "flush")
+					}
+					if err := meta.WriteToDir(logger, filepath.Join(tbc.tmpDir, newID.String())); err != nil {
+						errs <- err
+					}
+					rewritten <- blockIDs{old: id, new: newID}
+				}
+			}()
+
+			if !tbc.dryRun {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for id := range rewritten {
+						level.Info(logger).Log("msg", "uploading new block", "source", id.old, "new", id.new)
+						if tbc.promBlocks {
+							if err := block.UploadPromBlock(ctx, logger, insBkt, filepath.Join(tbc.tmpDir, id.new.String()), metadata.HashFunc(*hashFunc)); err != nil {
+								errs <- errors.Wrap(err, "upload")
+								return
+							}
+						} else {
+							if err := block.Upload(ctx, logger, insBkt, filepath.Join(tbc.tmpDir, id.new.String()), metadata.HashFunc(*hashFunc)); err != nil {
+								errs <- errors.Wrap(err, "upload")
+								return
+							}
+						}
+						level.Info(logger).Log("msg", "uploaded", "source", id, "new", id.new)
+
+						if !tbc.dryRun && tbc.deleteBlocks {
+							if err := block.MarkForDeletion(ctx, logger, insBkt, id.old, "block rewritten", stubCounter); err != nil {
+								level.Error(logger).Log("msg", "failed to mark block for deletion", "id", id.old.String(), "err", err)
+							}
+						}
+					}
+				}()
+			}
+
+			done := make(chan struct{})
+			go func() {
+				wg.Wait()
+				<-done
+			}()
+			
+			select {
+			case <-done:
+				level.Info(logger).Log("msg", "rewrite done", "IDs", strings.Join(tbc.blockIDs, ","))
+				return nil
+			case err := <-errs:
+				cancel()
+				level.Info(logger).Log("msg", "failed", "err", err)
+				return err
+			}
 		}, func(err error) {
 			cancel()
 		})
